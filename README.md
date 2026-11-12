@@ -1,23 +1,21 @@
-# Bitget Daily Volume Profile Scanner V2
+# Bitget Scanner V2.5
 
-Daily scan of all Bitget active USDT perpetual futures. Uses 1-minute OHLCV candles for the previous **UTC** day, a 60-row price histogram and a 70% value area. Compares the final minute close (= final 15-minute candle close at 00:00 UTC) to VAH/VAL. Sends **one Telegram message only if any hits**.
+## Installation
 
-## Install using Android only
-1. Create a GitHub account at https://github.com/signup and a **public** repository named `bitget-volume-scanner` (public repos typically have free GitHub-hosted Actions minutes). Keep it public ONLY because the code contains no secrets.
-2. Unzip the archive using Android Files. On github.com in your browser, open your repository and use **Add file → Upload files** for `scanner.py`, `requirements.txt`, and `README.md`. Uploading nested dotfolders can be awkward on mobile: create `.github/workflows/daily.yml` with **Add file → Create new file**, typing the full path, and paste the contents of the bundled file. Commit to the default branch.
-3. In Telegram, message https://t.me/BotFather with `/newbot`; copy the bot token privately. Open your new bot and send `/start`.
-4. In your browser open `https://api.telegram.org/botYOUR_TOKEN/getUpdates`, replacing YOUR_TOKEN. Find `message.chat.id`. Keep token private; never post a screenshot containing it.
-5. GitHub repo → Settings → Secrets and variables → Actions → New repository secret: create `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-6. Repo → Actions → Bitget Daily Volume Profile Scanner → Run workflow. Inspect job logs; when no hits occur, **no Telegram message is expected**.
-7. GitHub Actions cron is `17 0 * * *` (00:17 UTC), not guaranteed exact. Public repos with 60 days inactivity may have scheduled workflows disabled. Review periodically.
+Replace root `scanner.py`, `requirements.txt` and `.github/workflows/daily.yml` with the files in this package. Add the `state/profiles.json` and `state/alerts.json` files at exactly those paths. **Remove any other GitHub Actions workflow that still launches the scanner**, to avoid duplicate scans and alerts.
 
-## How the approximation works
-For each of the 1440 complete 1m candles, distribute base-asset volume uniformly across price bins intersecting the candle's high-low range. For zero-range candles, assign all volume to the close's bin. POC is the maximum-volume bin. Expand from POC to the adjacent higher-volume bin until at least 70% of total volume is included. VAH and VAL are the outer bin edges. The last 1m close equals the 23:45–00:00 M15 candle close. This approximation can differ from TradingView's intrabar FRVP, especially around tick size, row rounding and VA tie-breaking. Verify against TradingView before relying on signals.
+GitHub repository **Settings > Actions > General > Workflow permissions**: select **Read and write permissions**. The workflow also declares `permissions: contents: write`.
 
-## Data safety
-Bitget public API v2 endpoints: `/api/v2/mix/market/contracts` and `/api/v2/mix/market/history-candles`. Historical candles max 200 per call. Requests are globally paced at >=0.22 sec, with retries. Each pair must have exactly 1440 candles, otherwise it is skipped and logged. Pairs newly listed during the day will be skipped. The scan may take many minutes depending on pair count. Errors appear in GitHub logs; Telegram is sent only for hits. Telegram has a message-size limit, so exceptionally long results are truncated, with full hits in the logs. If more than 20% of pairs fail, workflow is marked failed.
+Existing secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 
-## Manual date
-Actions → Run workflow → scan_date `2026-11-11` (up to 25 days old). Omit to scan yesterday. A manual run sends a message if there are hits, potentially duplicating a previous daily notification.
+Manual runs: Actions > Bitget Volume Scanner V2.5 > Run workflow > choose `daily` (full daily profile and Telegram report) or `monitor` (checks current-day saved POCs). A `monitor` run before a successful daily run does nothing.
 
-No trading orders are placed. No guarantee of profits, data availability or TradingView exact match.
+## Behavior
+
+- 00:17 UTC daily: selects up to 200 allowed crypto USDT perpetuals with >=10M USDT 24h futures turnover; computes yesterday's 60-row, 70%-VA approximate FRVP; logs all analyzed markets; sends all BUY/SELL signals in chunks; saves today's POC reference for **all** successfully analyzed markets.
+- Every five minutes (best effort): reads saved POCs; checks the last **two completed 15m candles** with 2-minute safety buffer. Alerts when price crosses from >1% away to <=1% away from POC, moves closer, and stays on the same side of POC. One alert **per symbol per UTC day**. No alerts for a market that was already within 1% before the last bar or crossed the POC in that bar.
+- `state/alerts.json` is committed and pushed **before** sending Telegram. This prioritizes avoiding repeat alerts if a job is retried; if Telegram delivery fails after the commit, an alert can be missed. Telegram cannot provide true end-to-end exactly-once delivery. A rare Telegram network failure after a successful send may also cause a duplicate due to retries.
+- GitHub Actions scheduled executions can be delayed or skipped. 5-minute schedule is best effort, not a real-time guarantee. A daily job may occupy the shared concurrency lock while it runs.
+- GitHub `GITHUB_TOKEN` commits update files in the repository. A separate monitor job with a stale checkout is avoided by shared concurrency group and job-level checkout.
+- `SCAN_DATE` is only for historical daily tests; when historical, it does not replace the active POC state.
+- No automatic orders, no EMA filter, no leverage calculations. Signals are informational only.
