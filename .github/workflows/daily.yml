@@ -1,22 +1,39 @@
 
-name: Bitget Daily Volume Profile Scanner
+name: Bitget Volume Scanner V2.5
 
 on:
   schedule:
     - cron: '17 0 * * *'
+    - cron: '*/5 * * * *'
+
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'daily or monitor'
+        required: true
+        type: choice
+        options:
+          - daily
+          - monitor
+        default: daily
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: bitget-v25-state
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,8 +43,38 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scanner
+      - name: Select mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          MANUAL_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "mode=${MANUAL_MODE:-daily}" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_SCHEDULE" = "17 0 * * *" ]; then
+            echo 'mode=daily' >> "$GITHUB_OUTPUT"
+          else
+            echo 'mode=monitor' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Analyze and prepare alerts
+        env:
+          SCAN_MODE: ${{ steps.mode.outputs.mode }}
+        run: python scanner.py prepare
+
+      - name: Save persistent state
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state/profiles.json state/alerts.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update Bitget V2.5 state [skip ci]'
+            git push
+          fi
+
+      - name: Send Telegram messages
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner.py prepare
+        run: python scanner.py dispatch
