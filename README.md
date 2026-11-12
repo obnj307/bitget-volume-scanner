@@ -1,21 +1,23 @@
-# Bitget Scanner V2.5
+# Bitget Volume Scanner V2.6
 
-## Installation
+V2.5 daily FRVP retained (60 rows, 70% value area, 10M USDT turnover, top 200). V2.6 adds independent daily per-symbol alerts for:
 
-Replace root `scanner.py`, `requirements.txt` and `.github/workflows/daily.yml` with the files in this package. Add the `state/profiles.json` and `state/alerts.json` files at exactly those paths. **Remove any other GitHub Actions workflow that still launches the scanner**, to avoid duplicate scans and alerts.
+- `approach`: completed M15 close crosses inward from >1% to <=1% POC distance, same side of POC.
+- `near`: completed M15 close crosses inward from >0.25% to <=0.25%, same side of POC.
+- `contact`: completed M15 candle LOW <= POC <= HIGH, regardless of close.
 
-GitHub repository **Settings > Actions > General > Workflow permissions**: select **Read and write permissions**. The workflow also declares `permissions: contents: write`.
+POC is from the prior completed UTC day's volume profile. One alert per stage per symbol per UTC day; old V2.5 approach alerts are migrated. If the price jumps directly across both thresholds in one M15 bar without crossing POC, both alerts can fire. A contact may occur independently of either close-based threshold. All checks use the last completed M15 candle, with a 2-minute confirmation buffer. GitHub cron every 5 minutes is best-effort, not exact.
 
-Existing secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+## GitHub installation
 
-Manual runs: Actions > Bitget Volume Scanner V2.5 > Run workflow > choose `daily` (full daily profile and Telegram report) or `monitor` (checks current-day saved POCs). A `monitor` run before a successful daily run does nothing.
+1. Back up V2.5. Replace repository root `scanner.py`, `.github/workflows/daily.yml`; `requirements.txt` unchanged but included.
+2. **Keep existing** `state/profiles.json` and `state/alerts.json` in the repo; do not overwrite with the empty samples when upgrading. This preserves same-day alert history. The daily scan resets alert history only when UTC date changes.
+3. Settings > Actions > General > Workflow permissions: Read and write. Keep Telegram secrets `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+4. Actions > Bitget Volume Scanner V2.6 > Run workflow > `daily` (profile and daily report); then `monitor` for a manual test. Scheduled runs: 00:17 UTC daily, every 5 minutes monitor.
+5. A green run without Telegram means no new event. Inspect Analyze and prepare alerts logs.
 
-## Behavior
+## Delivery caveat
 
-- 00:17 UTC daily: selects up to 200 allowed crypto USDT perpetuals with >=10M USDT 24h futures turnover; computes yesterday's 60-row, 70%-VA approximate FRVP; logs all analyzed markets; sends all BUY/SELL signals in chunks; saves today's POC reference for **all** successfully analyzed markets.
-- Every five minutes (best effort): reads saved POCs; checks the last **two completed 15m candles** with 2-minute safety buffer. Alerts when price crosses from >1% away to <=1% away from POC, moves closer, and stays on the same side of POC. One alert **per symbol per UTC day**. No alerts for a market that was already within 1% before the last bar or crossed the POC in that bar.
-- `state/alerts.json` is committed and pushed **before** sending Telegram. This prioritizes avoiding repeat alerts if a job is retried; if Telegram delivery fails after the commit, an alert can be missed. Telegram cannot provide true end-to-end exactly-once delivery. A rare Telegram network failure after a successful send may also cause a duplicate due to retries.
-- GitHub Actions scheduled executions can be delayed or skipped. 5-minute schedule is best effort, not a real-time guarantee. A daily job may occupy the shared concurrency lock while it runs.
-- GitHub `GITHUB_TOKEN` commits update files in the repository. A separate monitor job with a stale checkout is avoided by shared concurrency group and job-level checkout.
-- `SCAN_DATE` is only for historical daily tests; when historical, it does not replace the active POC state.
-- No automatic orders, no EMA filter, no leverage calculations. Signals are informational only.
+As in V2.5, the state is committed before dispatch. A Telegram send failure may leave an event marked as sent; Telegram retries can also produce duplicates after ambiguous network failures. This is not a guaranteed exactly-once delivery mechanism.
+
+No trades are placed. Signals are informational. The 60-row FRVP is an approximation and may differ from TradingView.

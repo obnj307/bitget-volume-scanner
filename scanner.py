@@ -1,4 +1,4 @@
-"""Bitget V2.5: daily FRVP + 5-minute POC approach monitor. Alerts only, no trading."""
+"""Bitget V2.6: daily FRVP + three-stage POC monitor. Alerts only, no trading."""
 import os
 import time
 import math
@@ -22,6 +22,7 @@ WORKERS = int(os.getenv('WORKERS', '3'))
 MIN_INTERVAL = float(os.getenv('REQUEST_INTERVAL', '0.22'))
 TELEGRAM_MAX_CHARS = 3500
 POC_THRESHOLD_PCT = 1.0
+POC_NEAR_THRESHOLD_PCT = 0.25
 STATE_DIR = Path('state')
 PROFILES_FILE = STATE_DIR / 'profiles.json'
 ALERTS_FILE = STATE_DIR / 'alerts.json'
@@ -333,7 +334,7 @@ def daily():
     if (now - end).days > 25:
         raise DataError('Historical 1m data may be unavailable')
     start_ms, end_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
-    logging.info('Scanner V2.5 DAILY | profile=[%s,%s) | M15 close=%s',
+    logging.info('Scanner V2.6 DAILY | profile=[%s,%s) | M15 close=%s',
                  utc_label(start), utc_label(end), utc_label(end))
     selected = symbols()
     turnover_by_symbol = dict(selected)
@@ -411,14 +412,13 @@ def daily():
 
 
 def recent_completed_m15(symbol, now):
-    """Read two adjacent completed 15m bars; exclude forming candle.
+    """Two adjacent CLOSED M15 bars with 2-minute confirmation buffer.
 
-    Uses a 2-minute close-confirmation buffer and validates timestamps.
+    Return previous close, current close/high/low, and current bar end UTC.
     """
     safe = now - timedelta(minutes=2)
-    end_minute = (safe.minute // 15) * 15
-    last_end = safe.replace(minute=end_minute, second=0, microsecond=0)
-    # Last closed bar starts 15 minutes before last_end.
+    last_end = safe.replace(minute=(safe.minute // 15) * 15,
+                            second=0, microsecond=0)
     current_start = last_end - timedelta(minutes=15)
     previous_start = current_start - timedelta(minutes=15)
     start_ms = int((previous_start - timedelta(minutes=15)).timestamp() * 1000)
@@ -432,12 +432,52 @@ def recent_completed_m15(symbol, now):
     curr_ts = int(current_start.timestamp() * 1000)
     if prev_ts not in by_ts or curr_ts not in by_ts:
         raise DataError(f'Missing completed M15 candles {previous_start}, {current_start}')
-    prev_close = float(by_ts[prev_ts][4])
-    curr_close = float(by_ts[curr_ts][4])
-    if not (math.isfinite(prev_close) and math.isfinite(curr_close)
-            and prev_close > 0 and curr_close > 0):
-        raise DataError('Invalid M15 close')
-    return prev_close, curr_close, last_end
+    previous, current = by_ts[prev_ts], by_ts[curr_ts]
+    prev_close = float(previous[4])
+    curr_high, curr_low, curr_close = (float(current[2]), float(current[3]),
+                                      float(current[4]))
+    if not all(math.isfinite(x) and x > 0 for x in
+               (prev_close, curr_high, curr_low, curr_close)):
+        raise DataError('Invalid M15 prices')
+    if curr_low > min(curr_close, curr_high) or curr_high < curr_close:
+        raise DataError('Invalid M15 OHLC ordering')
+    return prev_close, curr_close, curr_high, curr_low, last_end
+
+
+def normalized_stage_state(value):
+    """Migrate V2.5 once-per-coin alerts to V2.6 stage flags.
+
+    V2.5 'sent': {'ADAUSDT': {'m15_end_utc': ...}} means approach already sent.
+    """
+    if not isinstance(value, dict):
+        return {}
+    if 'stages' in value and isinstance(value['stages'], dict):
+        return value['stages']
+    if 'm15_end_utc' in value:
+        return {'approach': value}
+    return {}
+
+
+def detect_poc_events(prev, curr, high, low, poc, stages):
+    """Return new events, independently deduplicated by stage per UTC day.
+
+    Close-based approaches require a new inward threshold crossing on the same
+    side of POC. Contact is defined by the completed candle's low <= POC <= high.
+    """
+    prev_pct = abs(prev - poc) / poc * 100
+    curr_pct = abs(curr - poc) / poc * 100
+    same_side = (prev - poc) * (curr - poc) > 0
+    moving_closer = curr_pct < prev_pct
+    events = []
+    if (not stages.get('approach') and same_side and moving_closer
+            and prev_pct > POC_THRESHOLD_PCT >= curr_pct):
+        events.append('approach')
+    if (not stages.get('near') and same_side and moving_closer
+            and prev_pct > POC_NEAR_THRESHOLD_PCT >= curr_pct):
+        events.append('near')
+    if not stages.get('contact') and low <= poc <= high:
+        events.append('contact')
+    return events, prev_pct, curr_pct
 
 
 def monitor():
@@ -452,60 +492,75 @@ def monitor():
     alert_state = read_json(ALERTS_FILE)
     if alert_state.get('monitor_date_utc') != today:
         alert_state = {'monitor_date_utc': today, 'sent': {}}
-    sent = alert_state['sent']
+    sent = alert_state.setdefault('sent', {})
     matches, errors = [], []
     for i, (symbol, levels) in enumerate(sorted(symbols_data.items()), 1):
-        # Once per symbol per UTC day, even if the market moves away and returns.
-        if symbol in sent:
-            continue
         poc = float(levels['poc'])
-        if poc <= 0:
+        if not math.isfinite(poc) or poc <= 0:
+            continue
+        stages = normalized_stage_state(sent.get(symbol))
+        if all(stages.get(stage) for stage in ('approach', 'near', 'contact')):
             continue
         try:
-            prev, curr, bar_end = recent_completed_m15(symbol, now)
+            prev, curr, high, low, bar_end = recent_completed_m15(symbol, now)
         except Exception as exc:
             errors.append((symbol, str(exc)))
             logging.warning('MONITOR %s skipped: %s', symbol, exc)
             continue
-        prev_pct = abs(prev-poc)/poc*100
-        curr_pct = abs(curr-poc)/poc*100
-        # New crossing INTO 1% zone, moving closer, on same side of POC.
-        same_side = (prev-poc)*(curr-poc) > 0
-        approaching = same_side and prev_pct > POC_THRESHOLD_PCT >= curr_pct
-        if approaching:
-            side = 'von oben (fallend)' if curr > poc else 'von unten (steigend)'
-            matches.append({'symbol': symbol, 'poc': poc, 'close': curr,
+        # Do not classify a candle from yesterday against today's reference POC.
+        if bar_end.date().isoformat() != today:
+            continue
+        events, prev_pct, curr_pct = detect_poc_events(
+            prev, curr, high, low, poc, stages)
+        side = ('von oben (fallend)' if curr > poc else
+                'von unten (steigend)' if curr < poc else 'auf POC')
+        for stage in events:
+            matches.append({'stage': stage, 'symbol': symbol, 'poc': poc,
+                            'close': curr, 'high': high, 'low': low,
                             'prev_pct': prev_pct, 'curr_pct': curr_pct,
                             'bar_end': utc_label(bar_end), 'side': side})
-            sent[symbol] = {'m15_end_utc': utc_label(bar_end),
-                            'poc': poc, 'close': curr}
+            stages[stage] = {'m15_end_utc': utc_label(bar_end),
+                             'poc': poc, 'close': curr}
+        if events:
+            sent[symbol] = {'stages': stages}
         if i % 50 == 0:
-            logging.info('Monitor %d/%d checked, %d new approaches',
+            logging.info('Monitor %d/%d checked, %d new stage alerts',
                          i, len(symbols_data), len(matches))
+    # Preserve V2.5 behavior: reserve alert keys before Telegram dispatch.
+    # This avoids duplicates on reruns but is not exactly-once delivery if
+    # Telegram dispatch fails. Check workflow logs in that case.
+    if symbols_data and len(errors) > .2 * len(symbols_data):
+        raise DataError('Too many monitor errors; state not updated')
     write_json(ALERTS_FILE, alert_state)
-    matches.sort(key=lambda x:(x['curr_pct'],x['symbol']))
+    matches.sort(key=lambda x: (('approach', 'near', 'contact').index(x['stage']),
+                                x['curr_pct'], x['symbol']))
+    labels = {'approach': 'ANNAEHERUNG <=1%',
+              'near': 'FAST ERREICHT <=0.25%',
+              'contact': 'POC-KONTAKT'}
     for h in matches:
-        logging.info('POC_APPROACH %s close=%g POC=%g prev=%.3f%% now=%.3f%% '
-                     'M15_end=%s', h['symbol'], h['close'], h['poc'],
-                     h['prev_pct'], h['curr_pct'], h['bar_end'])
+        logging.info('POC_%s %s close=%g POC=%g previous=%.3f%% now=%.3f%% '
+                     'high=%g low=%g M15_end=%s',
+                     h['stage'].upper(), h['symbol'], h['close'], h['poc'],
+                     h['prev_pct'], h['curr_pct'], h['high'], h['low'], h['bar_end'])
     if matches:
-        header = (f'Bitget POC Annäherung | {today} UTC\n'
+        header = (f'Bitget POC Monitor V2.6 | {today} UTC\n'
                   f'Referenzprofil: {profiles["profile_date_utc"]} UTC\n'
-                  f'Abstand <= {POC_THRESHOLD_PCT:g}% | M15 Schlusskurs')
+                  '3 Alarmstufen | abgeschlossene M15-Kerzen')
         entries = [
-            f"{h['symbol']} | {h['side']} | Close {h['close']:.9g} "
-            f"| POC {h['poc']:.9g} | Abstand {h['prev_pct']:.3f}% -> "
-            f"{h['curr_pct']:.3f}% | M15 Ende {h['bar_end']}"
+            f"{labels[h['stage']]} | {h['symbol']} | {h['side']} "
+            f"| Close {h['close']:.9g} | POC {h['poc']:.9g} "
+            f"| Abstand {h['prev_pct']:.3f}% -> {h['curr_pct']:.3f}% "
+            + (f"| M15 High {h['high']:.9g} Low {h['low']:.9g} "
+               if h['stage'] == 'contact' else '')
+            + f"| M15 Ende {h['bar_end']}"
             for h in matches
         ]
         messages = queue_messages(header, entries)
     else:
         messages = []
     write_json(OUTBOX_FILE, messages)
-    logging.info('Finished MONITOR: %d references, %d new alerts, %d errors',
+    logging.info('Finished MONITOR V2.6: %d references, %d new stage alerts, %d errors',
                  len(symbols_data), len(matches), len(errors))
-    if symbols_data and len(errors) > .2 * len(symbols_data):
-        raise DataError('Too many monitor errors; inspect API/candles')
 
 
 def dispatch():
