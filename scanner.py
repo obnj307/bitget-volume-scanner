@@ -1,4 +1,4 @@
-"""Bitget daily approximate FRVP scanner V2.3. Public market data only; no trading."""
+"""Bitget daily approximate FRVP scanner V2.4. Public market data only; no trading."""
 import os
 import time
 import math
@@ -13,8 +13,8 @@ import requests
 BASE = 'https://api.bitget.com'
 ROWS = 60
 VALUE_AREA = 0.70
-MIN_VOLUME_USDT = 50_000_000
-MAX_SYMBOLS = 100
+MIN_VOLUME_USDT = 10_000_000
+MAX_SYMBOLS = 200
 WORKERS = int(os.getenv('WORKERS', '3'))
 MIN_INTERVAL = float(os.getenv('REQUEST_INTERVAL', '0.22'))
 TELEGRAM_MAX_CHARS = 3500
@@ -62,7 +62,31 @@ def api(path, params):
             time.sleep(min(2 ** attempt, 12))
 
 
+def parse_turnover(ticker, symbol):
+    """Return 24h turnover in USDT for a USDT-quoted futures contract.
+
+    Bitget reports usdtVolume and quoteVolume as quote-currency turnover.
+    baseVolume is base-coin quantity and must NOT be used as USDT.
+    """
+    for field in ('usdtVolume', 'quoteVolume'):
+        raw = ticker.get(field)
+        if raw is None or raw == '':
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logging.warning('%s invalid %s=%r', symbol, field, raw)
+            continue
+        if math.isfinite(value) and value >= 0:
+            if field == 'quoteVolume':
+                logging.info('%s: using quoteVolume fallback (USDT quote)', symbol)
+            return value
+        logging.warning('%s invalid %s=%r', symbol, field, raw)
+    return None
+
+
 def symbols():
+    """Select active USDT futures for explicitly allowed crypto assets."""
     contracts = api('/api/v2/mix/market/contracts', {'productType': 'USDT-FUTURES'})
     tickers = api('/api/v2/mix/market/tickers', {'productType': 'USDT-FUTURES'})
     eligible = set()
@@ -70,33 +94,38 @@ def symbols():
         symbol = contract.get('symbol', '')
         base = contract.get('baseCoin', '').upper()
         if (contract.get('quoteCoin', '').upper() == 'USDT'
-                and symbol.endswith('USDT')
+                and symbol == base + 'USDT'
                 and contract.get('symbolStatus', '').lower() == 'normal'
                 and base in CRYPTO_BASES):
             eligible.add(symbol)
 
+    ticker_by_symbol = {t.get('symbol'): t for t in tickers}
     ranked = []
-    for ticker in tickers:
-        symbol = ticker.get('symbol', '')
-        if symbol not in eligible:
+    missing = 0
+    for symbol in sorted(eligible):
+        ticker = ticker_by_symbol.get(symbol)
+        if ticker is None:
+            logging.warning('%s has no 24h futures ticker', symbol)
+            missing += 1
             continue
-        try:
-            # Bitget's usdtVolume is the 24h turnover denominated in USDT.
-            turnover = float(ticker.get('usdtVolume') or 0)
-        except (TypeError, ValueError):
+        turnover = parse_turnover(ticker, symbol)
+        if turnover is None:
+            logging.warning('%s has no valid USDT turnover', symbol)
+            missing += 1
             continue
-        if math.isfinite(turnover) and turnover >= MIN_VOLUME_USDT:
+        if turnover >= MIN_VOLUME_USDT:
             ranked.append((symbol, turnover))
 
     ranked.sort(key=lambda x: (-x[1], x[0]))
     chosen = ranked[:MAX_SYMBOLS]
-    logging.info('Liquidity filter: %d crypto contracts eligible, %d pass >= %s USDT/24h, analyzing top %d',
-                 len(eligible), len(ranked), f'{MIN_VOLUME_USDT:,}', len(chosen))
-    for symbol, volume in chosen:
-        logging.info('Selected %s | 24h futures turnover %.2f USDT', symbol, volume)
+    logging.info('Liquidity filter: %d eligible crypto futures, %d pass >= %s USDT/24h, '
+                 '%d missing/invalid tickers, analyzing top %d',
+                 len(eligible), len(ranked), f'{MIN_VOLUME_USDT:,}', missing, len(chosen))
+    for symbol, turnover in chosen:
+        logging.info('Selected %s | 24h futures turnover %.2f USDT', symbol, turnover)
     if not chosen:
-        raise DataError('No eligible crypto futures passed the volume filter; check ticker usdtVolume')
-    return [symbol for symbol, _ in chosen]
+        raise DataError('No crypto futures passed liquidity filter; inspect ticker fields')
+    return chosen
 
 
 def candles(symbol, start_ms, end_ms):
@@ -172,16 +201,17 @@ def analyze(symbol, start_ms, end_ms):
     values = candles(symbol, start_ms, end_ms)
     val, vah, poc = profile(values)
     close = float(values[-1, 3])
-    direction = 'BUY' if close > vah else ('SELL' if close < val else None)
-    if direction:
-        return {'symbol': symbol, 'direction': direction, 'close': close,
-                'vah': vah, 'val': val, 'poc': poc}
-    return None
+    direction = 'BUY' if close > vah else ('SELL' if close < val else 'NEUTRAL')
+    boundary = vah if direction == 'BUY' else val if direction == 'SELL' else (
+        vah if abs(close - vah) / vah <= abs(close - val) / val else val
+    )
+    distance = abs(close - boundary) / boundary * 100
+    return {'symbol': symbol, 'direction': direction, 'close': close,
+            'vah': vah, 'val': val, 'poc': poc, 'distance': distance}
 
 
 def distance_percent(hit):
-    boundary = hit['vah'] if hit['direction'] == 'BUY' else hit['val']
-    return abs(hit['close'] - boundary) / boundary * 100 if boundary > 0 else float('inf')
+    return hit['distance']
 
 
 def telegram_send(message):
@@ -251,35 +281,58 @@ def main():
     if (now - end).days > 25:
         raise DataError('1m history may be unavailable after 25 days')
     start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
-    names = symbols()
-    hits, errors = [], []
-    logging.info('Scanning %d liquid crypto symbols for %s UTC', len(names), day)
+    logging.info('Scanner V2.4 | UTC run=%s | profile=[%s, %s) | final M15=[%s, %s)',
+                 now.isoformat(), start.isoformat(), end.isoformat(),
+                 (end - timedelta(minutes=15)).isoformat(), end.isoformat())
+    selected = symbols()
+    names = [symbol for symbol, _ in selected]
+    turnover_by_symbol = dict(selected)
+    results, errors = [], []
+    logging.info('Scanning %d liquid crypto futures for %s UTC', len(names), day)
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(analyze, name, start_ms, end_ms): name for name in names}
         for i, future in enumerate(as_completed(futures), 1):
             name = futures[future]
             try:
-                hit = future.result()
-                if hit:
-                    hits.append(hit)
+                result = future.result()
+                result['turnover'] = turnover_by_symbol[name]
+                results.append(result)
             except Exception as exc:
                 errors.append((name, str(exc)))
                 logging.warning('%s skipped: %s', name, exc)
             if i % 25 == 0:
-                logging.info('%d/%d complete, %d hits, %d skipped', i, len(names), len(hits), len(errors))
+                logging.info('%d/%d complete, %d analyzed, %d skipped',
+                             i, len(names), len(results), len(errors))
+
+    # Log EVERY successfully analyzed market, including NEUTRAL.
+    for result in sorted(results, key=lambda h: h['symbol']):
+        logging.info('DIAG %s status=%s close=%.9g VAH=%.9g VAL=%.9g POC=%.9g '
+                     'nearest_boundary_distance=%.4f%% turnover24h=%.2f USDT '
+                     'M15_close_UTC=%s',
+                     result['symbol'], result['direction'], result['close'],
+                     result['vah'], result['val'], result['poc'], result['distance'],
+                     result['turnover'], end.isoformat())
+
+    hits = [h for h in results if h['direction'] != 'NEUTRAL']
     hits.sort(key=lambda h: (distance_percent(h), h['symbol']))
     for rank, hit in enumerate(hits, 1):
-        logging.info('#%d %s %s distance=%.4f%% close=%g VAH=%g VAL=%g POC=%g',
-                     rank, hit['direction'], hit['symbol'], distance_percent(hit),
-                     hit['close'], hit['vah'], hit['val'], hit['poc'])
-    logging.info('Finished: %d selected, %d hits, %d skipped', len(names), len(hits), len(errors))
+        logging.info('SIGNAL #%d %s %s distance=%.4f%% close=%.9g VAH=%.9g '
+                     'VAL=%.9g POC=%.9g turnover24h=%.2f USDT',
+                     rank, hit['direction'], hit['symbol'], hit['distance'],
+                     hit['close'], hit['vah'], hit['val'], hit['poc'], hit['turnover'])
+    logging.info('Finished: %d selected, %d analyzed, %d hits, %d neutral, %d skipped',
+                 len(names), len(results), len(hits), len(results)-len(hits), len(errors))
+
     if hits:
         header = (f'Bitget FRVP {ROWS} rows / VA {VALUE_AREA:.0%} | {day} UTC\n'
-                  f'Checked {len(names)-len(errors)}/{len(names)} | Signals {len(hits)}\n'
+                  f'Profile: {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC\n'
+                  f'Final M15 close: {end:%Y-%m-%d %H:%M} UTC\n'
+                  f'Checked {len(results)}/{len(names)} | Signals {len(hits)}\n'
                   f'Filter: >= {MIN_VOLUME_USDT/1_000_000:g}M USDT/24h, top {MAX_SYMBOLS}\n'
                   'Sorted by distance to VAH/VAL; approximate 1m profile')
         entries = [
-            f"#{rank} {hit['direction']} {hit['symbol']} | Abstand {distance_percent(hit):.3f}% "
+            f"#{rank} {hit['direction']} {hit['symbol']} | Abstand {hit['distance']:.3f}% "
+            f"| Vol24h {hit['turnover']/1_000_000:.1f}M USDT "
             f"| Close {hit['close']:.9g} | VAH {hit['vah']:.9g} | VAL {hit['val']:.9g}"
             for rank, hit in enumerate(hits, 1)
         ]
