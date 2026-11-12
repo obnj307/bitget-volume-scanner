@@ -1,9 +1,12 @@
-"""Bitget daily approximate FRVP scanner V2.4. Public market data only; no trading."""
+"""Bitget V2.5: daily FRVP + 5-minute POC approach monitor. Alerts only, no trading."""
 import os
 import time
 import math
 import logging
 import threading
+import json
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,6 +21,11 @@ MAX_SYMBOLS = 200
 WORKERS = int(os.getenv('WORKERS', '3'))
 MIN_INTERVAL = float(os.getenv('REQUEST_INTERVAL', '0.22'))
 TELEGRAM_MAX_CHARS = 3500
+POC_THRESHOLD_PCT = 1.0
+STATE_DIR = Path('state')
+PROFILES_FILE = STATE_DIR / 'profiles.json'
+ALERTS_FILE = STATE_DIR / 'alerts.json'
+OUTBOX_FILE = Path('outbox.json')
 
 # Explicit cryptocurrency allowlist prevents stock-linked futures from being included.
 CRYPTO_BASES = set('''
@@ -267,9 +275,53 @@ def send_telegram_parts(header, entries, footer=''):
         time.sleep(0.5)
 
 
-def main():
-    if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'):
-        raise DataError('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID')
+
+
+def utc_label(dt):
+    return dt.strftime('%Y-%m-%d %H:%M UTC')
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + '.tmp')
+    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + '\n', encoding='utf-8')
+    temp.replace(path)
+
+
+def read_json(path):
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def queue_messages(header, entries, footer=''):
+    """Create Telegram messages <=4096 chars; no individual result is cut."""
+    if not entries:
+        return []
+    parts, current = [], []
+    size = 0
+    for entry in entries:
+        if len(entry) > 3000:
+            raise DataError('Single Telegram entry too long')
+        if current and size + len(entry) + 1 > TELEGRAM_MAX_CHARS - 500:
+            parts.append(current)
+            current, size = [], 0
+        current.append(entry)
+        size += len(entry) + 1
+    if current:
+        parts.append(current)
+    messages = []
+    for i, lines in enumerate(parts, 1):
+        msg = f'{header}\nTeil {i}/{len(parts)}\n\n' + '\n'.join(lines)
+        if i == len(parts) and footer:
+            msg += '\n\n' + footer
+        if len(msg) > 4096:
+            raise DataError('Telegram message exceeds limit')
+        messages.append(msg)
+    return messages
+
+
+def daily():
     now = datetime.now(timezone.utc)
     day = (now - timedelta(days=1)).date()
     if os.getenv('SCAN_DATE'):
@@ -277,69 +329,206 @@ def main():
     start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     if end > now - timedelta(minutes=2):
-        raise DataError('Day not fully closed yet')
+        raise DataError('Profile day not fully closed')
     if (now - end).days > 25:
-        raise DataError('1m history may be unavailable after 25 days')
-    start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
-    logging.info('Scanner V2.4 | UTC run=%s | profile=[%s, %s) | final M15=[%s, %s)',
-                 now.isoformat(), start.isoformat(), end.isoformat(),
-                 (end - timedelta(minutes=15)).isoformat(), end.isoformat())
+        raise DataError('Historical 1m data may be unavailable')
+    start_ms, end_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
+    logging.info('Scanner V2.5 DAILY | profile=[%s,%s) | M15 close=%s',
+                 utc_label(start), utc_label(end), utc_label(end))
     selected = symbols()
-    names = [symbol for symbol, _ in selected]
     turnover_by_symbol = dict(selected)
     results, errors = [], []
-    logging.info('Scanning %d liquid crypto futures for %s UTC', len(names), day)
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(analyze, name, start_ms, end_ms): name for name in names}
+        futures = {pool.submit(analyze, symbol, start_ms, end_ms): symbol
+                   for symbol, _ in selected}
         for i, future in enumerate(as_completed(futures), 1):
-            name = futures[future]
+            symbol = futures[future]
             try:
-                result = future.result()
-                result['turnover'] = turnover_by_symbol[name]
-                results.append(result)
+                item = future.result()
+                item['turnover'] = turnover_by_symbol[symbol]
+                results.append(item)
             except Exception as exc:
-                errors.append((name, str(exc)))
-                logging.warning('%s skipped: %s', name, exc)
+                errors.append((symbol, str(exc)))
+                logging.warning('%s skipped: %s', symbol, exc)
             if i % 25 == 0:
-                logging.info('%d/%d complete, %d analyzed, %d skipped',
-                             i, len(names), len(results), len(errors))
-
-    # Log EVERY successfully analyzed market, including NEUTRAL.
-    for result in sorted(results, key=lambda h: h['symbol']):
+                logging.info('Progress %d/%d, analyzed=%d, skipped=%d',
+                             i, len(selected), len(results), len(errors))
+    if len(errors) > len(selected) * .2:
+        raise DataError(f'Too many errors: {len(errors)}/{len(selected)}; state not updated')
+    for h in sorted(results, key=lambda x:x['symbol']):
         logging.info('DIAG %s status=%s close=%.9g VAH=%.9g VAL=%.9g POC=%.9g '
-                     'nearest_boundary_distance=%.4f%% turnover24h=%.2f USDT '
-                     'M15_close_UTC=%s',
-                     result['symbol'], result['direction'], result['close'],
-                     result['vah'], result['val'], result['poc'], result['distance'],
-                     result['turnover'], end.isoformat())
-
-    hits = [h for h in results if h['direction'] != 'NEUTRAL']
-    hits.sort(key=lambda h: (distance_percent(h), h['symbol']))
-    for rank, hit in enumerate(hits, 1):
-        logging.info('SIGNAL #%d %s %s distance=%.4f%% close=%.9g VAH=%.9g '
-                     'VAL=%.9g POC=%.9g turnover24h=%.2f USDT',
-                     rank, hit['direction'], hit['symbol'], hit['distance'],
-                     hit['close'], hit['vah'], hit['val'], hit['poc'], hit['turnover'])
-    logging.info('Finished: %d selected, %d analyzed, %d hits, %d neutral, %d skipped',
-                 len(names), len(results), len(hits), len(results)-len(hits), len(errors))
-
+                     'distance=%.4f%% volume24h=%.2f USDT M15_close=%s',
+                     h['symbol'], h['direction'], h['close'], h['vah'], h['val'],
+                     h['poc'], h['distance'], h['turnover'], utc_label(end))
+    hits = sorted((h for h in results if h['direction'] != 'NEUTRAL'),
+                  key=lambda h:(h['distance'],h['symbol']))
+    for i, h in enumerate(hits, 1):
+        logging.info('SIGNAL #%d %s %s distance=%.4f%%',
+                     i, h['direction'], h['symbol'], h['distance'])
+    logging.info('Finished DAILY: %d selected, %d analyzed, %d hits, %d skipped',
+                 len(selected), len(results), len(hits), len(errors))
+    # Store yesterday's POC as today's fixed reference. This also allows monitoring
+    # neutral coins. A manual historical SCAN_DATE is diagnostic-only for monitor.
+    if end.date() == now.date():
+        prior = read_json(PROFILES_FILE)
+        current_date = now.date().isoformat()
+        profiles = {
+            'monitor_date_utc': current_date,
+            'profile_date_utc': day.isoformat(),
+            'profile_start_utc': utc_label(start),
+            'profile_end_utc': utc_label(end),
+            'symbols': {h['symbol']: {'poc': h['poc'], 'vah': h['vah'],
+                                    'val': h['val'], 'turnover24h': h['turnover']}
+                        for h in results}
+        }
+        write_json(PROFILES_FILE, profiles)
+        # Preserve alert keys when rerunning same-day daily scan.
+        previous_alerts = read_json(ALERTS_FILE)
+        if previous_alerts.get('monitor_date_utc') != current_date:
+            write_json(ALERTS_FILE, {'monitor_date_utc': current_date, 'sent': {}})
+        logging.info('Stored %d POC references for %s UTC',
+                     len(results), current_date)
+    else:
+        logging.warning('Historical SCAN_DATE: not replacing active POC references')
     if hits:
-        header = (f'Bitget FRVP {ROWS} rows / VA {VALUE_AREA:.0%} | {day} UTC\n'
-                  f'Profile: {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC\n'
-                  f'Final M15 close: {end:%Y-%m-%d %H:%M} UTC\n'
-                  f'Checked {len(results)}/{len(names)} | Signals {len(hits)}\n'
-                  f'Filter: >= {MIN_VOLUME_USDT/1_000_000:g}M USDT/24h, top {MAX_SYMBOLS}\n'
-                  'Sorted by distance to VAH/VAL; approximate 1m profile')
+        header = (f'Bitget FRVP 60 rows / VA 70% | {day} UTC\n'
+                  f'Profile: {utc_label(start)} to {utc_label(end)}\n'
+                  f'Last M15 close: {utc_label(end)}\n'
+                  f'Checked {len(results)}/{len(selected)} | Signals {len(hits)}\n'
+                  f'Filter >=10M USDT/24h; top 200; sorted by VAH/VAL distance')
         entries = [
-            f"#{rank} {hit['direction']} {hit['symbol']} | Abstand {hit['distance']:.3f}% "
-            f"| Vol24h {hit['turnover']/1_000_000:.1f}M USDT "
-            f"| Close {hit['close']:.9g} | VAH {hit['vah']:.9g} | VAL {hit['val']:.9g}"
-            for rank, hit in enumerate(hits, 1)
+            f"#{i} {h['direction']} {h['symbol']} | Abstand {h['distance']:.3f}% "
+            f"| Vol24h {h['turnover']/1e6:.1f}M | Close {h['close']:.9g} "
+            f"| VAH {h['vah']:.9g} | VAL {h['val']:.9g} | POC {h['poc']:.9g}"
+            for i, h in enumerate(hits, 1)
         ]
-        footer = f'WARNING: {len(errors)} symbols skipped (see GitHub logs)' if errors else ''
-        send_telegram_parts(header, entries, footer)
-    if len(errors) > len(names) * 0.2:
-        raise DataError(f'Too many symbols skipped: {len(errors)}/{len(names)}')
+        footer = f'{len(errors)} skipped (see GitHub logs)' if errors else ''
+        messages = queue_messages(header, entries, footer)
+    else:
+        messages = []
+    write_json(OUTBOX_FILE, messages)
+    logging.info('Prepared %d daily Telegram message(s)', len(messages))
+
+
+def recent_completed_m15(symbol, now):
+    """Read two adjacent completed 15m bars; exclude forming candle.
+
+    Uses a 2-minute close-confirmation buffer and validates timestamps.
+    """
+    safe = now - timedelta(minutes=2)
+    end_minute = (safe.minute // 15) * 15
+    last_end = safe.replace(minute=end_minute, second=0, microsecond=0)
+    # Last closed bar starts 15 minutes before last_end.
+    current_start = last_end - timedelta(minutes=15)
+    previous_start = current_start - timedelta(minutes=15)
+    start_ms = int((previous_start - timedelta(minutes=15)).timestamp() * 1000)
+    end_ms = int((last_end + timedelta(minutes=15)).timestamp() * 1000)
+    bars = api('/api/v2/mix/market/history-candles', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES', 'granularity': '15m',
+        'startTime': str(start_ms), 'endTime': str(end_ms), 'limit': '10'
+    })
+    by_ts = {int(bar[0]): bar for bar in bars if len(bar) >= 5}
+    prev_ts = int(previous_start.timestamp() * 1000)
+    curr_ts = int(current_start.timestamp() * 1000)
+    if prev_ts not in by_ts or curr_ts not in by_ts:
+        raise DataError(f'Missing completed M15 candles {previous_start}, {current_start}')
+    prev_close = float(by_ts[prev_ts][4])
+    curr_close = float(by_ts[curr_ts][4])
+    if not (math.isfinite(prev_close) and math.isfinite(curr_close)
+            and prev_close > 0 and curr_close > 0):
+        raise DataError('Invalid M15 close')
+    return prev_close, curr_close, last_end
+
+
+def monitor():
+    now = datetime.now(timezone.utc)
+    profiles = read_json(PROFILES_FILE)
+    today = now.date().isoformat()
+    if profiles.get('monitor_date_utc') != today:
+        logging.warning('No current UTC-day POC snapshot. Wait for daily run; no alerts.')
+        write_json(OUTBOX_FILE, [])
+        return
+    symbols_data = profiles.get('symbols', {})
+    alert_state = read_json(ALERTS_FILE)
+    if alert_state.get('monitor_date_utc') != today:
+        alert_state = {'monitor_date_utc': today, 'sent': {}}
+    sent = alert_state['sent']
+    matches, errors = [], []
+    for i, (symbol, levels) in enumerate(sorted(symbols_data.items()), 1):
+        # Once per symbol per UTC day, even if the market moves away and returns.
+        if symbol in sent:
+            continue
+        poc = float(levels['poc'])
+        if poc <= 0:
+            continue
+        try:
+            prev, curr, bar_end = recent_completed_m15(symbol, now)
+        except Exception as exc:
+            errors.append((symbol, str(exc)))
+            logging.warning('MONITOR %s skipped: %s', symbol, exc)
+            continue
+        prev_pct = abs(prev-poc)/poc*100
+        curr_pct = abs(curr-poc)/poc*100
+        # New crossing INTO 1% zone, moving closer, on same side of POC.
+        same_side = (prev-poc)*(curr-poc) > 0
+        approaching = same_side and prev_pct > POC_THRESHOLD_PCT >= curr_pct
+        if approaching:
+            side = 'von oben (fallend)' if curr > poc else 'von unten (steigend)'
+            matches.append({'symbol': symbol, 'poc': poc, 'close': curr,
+                            'prev_pct': prev_pct, 'curr_pct': curr_pct,
+                            'bar_end': utc_label(bar_end), 'side': side})
+            sent[symbol] = {'m15_end_utc': utc_label(bar_end),
+                            'poc': poc, 'close': curr}
+        if i % 50 == 0:
+            logging.info('Monitor %d/%d checked, %d new approaches',
+                         i, len(symbols_data), len(matches))
+    write_json(ALERTS_FILE, alert_state)
+    matches.sort(key=lambda x:(x['curr_pct'],x['symbol']))
+    for h in matches:
+        logging.info('POC_APPROACH %s close=%g POC=%g prev=%.3f%% now=%.3f%% '
+                     'M15_end=%s', h['symbol'], h['close'], h['poc'],
+                     h['prev_pct'], h['curr_pct'], h['bar_end'])
+    if matches:
+        header = (f'Bitget POC Annäherung | {today} UTC\n'
+                  f'Referenzprofil: {profiles["profile_date_utc"]} UTC\n'
+                  f'Abstand <= {POC_THRESHOLD_PCT:g}% | M15 Schlusskurs')
+        entries = [
+            f"{h['symbol']} | {h['side']} | Close {h['close']:.9g} "
+            f"| POC {h['poc']:.9g} | Abstand {h['prev_pct']:.3f}% -> "
+            f"{h['curr_pct']:.3f}% | M15 Ende {h['bar_end']}"
+            for h in matches
+        ]
+        messages = queue_messages(header, entries)
+    else:
+        messages = []
+    write_json(OUTBOX_FILE, messages)
+    logging.info('Finished MONITOR: %d references, %d new alerts, %d errors',
+                 len(symbols_data), len(matches), len(errors))
+    if symbols_data and len(errors) > .2 * len(symbols_data):
+        raise DataError('Too many monitor errors; inspect API/candles')
+
+
+def dispatch():
+    messages = read_json(OUTBOX_FILE)
+    if not isinstance(messages, list):
+        raise DataError('Outbox must be a list')
+    if messages and (not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID')):
+        raise DataError('Missing Telegram secrets')
+    for i, message in enumerate(messages, 1):
+        telegram_send(message)
+        logging.info('Sent Telegram message %d/%d', i, len(messages))
+        time.sleep(0.5)
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ('prepare', 'dispatch'):
+        raise SystemExit('Usage: python scanner.py prepare|dispatch')
+    if sys.argv[1] == 'dispatch':
+        dispatch()
+    elif os.getenv('SCAN_MODE', 'daily').lower() == 'monitor':
+        monitor()
+    else:
+        daily()
 
 
 if __name__ == '__main__':
