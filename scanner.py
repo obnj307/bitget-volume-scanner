@@ -1,57 +1,103 @@
-"""Bitget daily 60-row approximate FRVP scanner. Public API; no trading."""
-import os, time, math, logging, threading
+"""Bitget daily approximate FRVP scanner V2.3. Public market data only; no trading."""
+import os
+import time
+import math
+import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
+
 import numpy as np
+import requests
 
 BASE = 'https://api.bitget.com'
 ROWS = 60
-VALUE_AREA = .70
+VALUE_AREA = 0.70
+MIN_VOLUME_USDT = 50_000_000
+MAX_SYMBOLS = 100
 WORKERS = int(os.getenv('WORKERS', '3'))
 MIN_INTERVAL = float(os.getenv('REQUEST_INTERVAL', '0.22'))
+TELEGRAM_MAX_CHARS = 3500
+
+# Explicit cryptocurrency allowlist prevents stock-linked futures from being included.
+CRYPTO_BASES = set('''
+BTC ETH XRP SOL BNB DOGE ADA TRX AVAX LINK DOT LTC BCH XLM HBAR SUI TON
+SHIB UNI NEAR APT ICP ETC FIL ATOM OP ARB INJ AAVE RENDER RUNE PEPE
+BONK WIF FLOKI PENGU SEI TIA ALGO VET FET TAO JUP ONDO ENA WLD
+GRT SAND MANA THETA EOS XTZ EGLD FLOW KAS STX CRV LDO MKR COMP
+SNX DYDX ZEC DASH XMR KAVA ROSE CHZ GALA AXS IMX ENS 1INCH
+NEO IOTA ZIL ZRX BAT QTUM MINA KSM CELO BLUR PYTH JTO JASMY
+FARTCOIN TRUMP W MNT POL STRK AR SUSHI CAKE PENDLE GMX
+'''.split())
+
 SESSION = requests.Session()
 LOCK = threading.Lock()
 NEXT = [0.0]
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+
 class DataError(Exception):
     pass
+
 
 def api(path, params):
     for attempt in range(5):
         with LOCK:
-            now = time.monotonic()
-            wait = max(0, NEXT[0] - now)
+            wait = max(0, NEXT[0] - time.monotonic())
             if wait:
                 time.sleep(wait)
             NEXT[0] = time.monotonic() + MIN_INTERVAL
         try:
-            r = SESSION.get(BASE + path, params=params, timeout=25)
-            if r.status_code in (429, 500, 502, 503, 504):
-                raise requests.RequestException(f'HTTP {r.status_code}')
-            r.raise_for_status()
-            data = r.json()
-            if data.get('code') != '00000':
-                raise DataError(f"Bitget {data.get('code')}: {data.get('msg')}")
-            return data.get('data') or []
+            response = SESSION.get(BASE + path, params=params, timeout=25)
+            if response.status_code in (429, 500, 502, 503, 504):
+                raise requests.RequestException(f'HTTP {response.status_code}')
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get('code') != '00000':
+                raise DataError(f"Bitget {payload.get('code')}: {payload.get('msg')}")
+            return payload.get('data') or []
         except (requests.RequestException, ValueError, DataError) as exc:
             if attempt == 4:
                 raise DataError(str(exc)) from exc
             time.sleep(min(2 ** attempt, 12))
 
+
 def symbols():
-    data = api('/api/v2/mix/market/contracts', {'productType': 'USDT-FUTURES'})
-    result = []
-    for x in data:
-        symbol = x.get('symbol', '')
-        if (x.get('quoteCoin', '').upper() == 'USDT'
+    contracts = api('/api/v2/mix/market/contracts', {'productType': 'USDT-FUTURES'})
+    tickers = api('/api/v2/mix/market/tickers', {'productType': 'USDT-FUTURES'})
+    eligible = set()
+    for contract in contracts:
+        symbol = contract.get('symbol', '')
+        base = contract.get('baseCoin', '').upper()
+        if (contract.get('quoteCoin', '').upper() == 'USDT'
                 and symbol.endswith('USDT')
-                and x.get('symbolStatus', '').lower() == 'normal'):
-            result.append(symbol)
-    if not result:
-        raise DataError('No active USDT futures returned; check Bitget status fields')
-    return sorted(set(result))
+                and contract.get('symbolStatus', '').lower() == 'normal'
+                and base in CRYPTO_BASES):
+            eligible.add(symbol)
+
+    ranked = []
+    for ticker in tickers:
+        symbol = ticker.get('symbol', '')
+        if symbol not in eligible:
+            continue
+        try:
+            # Bitget's usdtVolume is the 24h turnover denominated in USDT.
+            turnover = float(ticker.get('usdtVolume') or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(turnover) and turnover >= MIN_VOLUME_USDT:
+            ranked.append((symbol, turnover))
+
+    ranked.sort(key=lambda x: (-x[1], x[0]))
+    chosen = ranked[:MAX_SYMBOLS]
+    logging.info('Liquidity filter: %d crypto contracts eligible, %d pass >= %s USDT/24h, analyzing top %d',
+                 len(eligible), len(ranked), f'{MIN_VOLUME_USDT:,}', len(chosen))
+    for symbol, volume in chosen:
+        logging.info('Selected %s | 24h futures turnover %.2f USDT', symbol, volume)
+    if not chosen:
+        raise DataError('No eligible crypto futures passed the volume filter; check ticker usdtVolume')
+    return [symbol for symbol, _ in chosen]
+
 
 def candles(symbol, start_ms, end_ms):
     by_ts = {}
@@ -61,16 +107,17 @@ def candles(symbol, start_ms, end_ms):
         rows = api('/api/v2/mix/market/history-candles', {
             'symbol': symbol, 'productType': 'USDT-FUTURES', 'granularity': '1m',
             'startTime': str(max(start_ms, chunk_start - 60000)),
-            'endTime': str(chunk_end), 'limit': '200'})
-        for x in rows:
-            if len(x) < 7:
+            'endTime': str(chunk_end), 'limit': '200'
+        })
+        for row in rows:
+            if len(row) < 7:
                 continue
-            ts = int(x[0])
+            ts = int(row[0])
             if start_ms <= ts < end_ms:
-                by_ts[ts] = [float(v) for v in x[1:7]]
+                by_ts[ts] = [float(v) for v in row[1:7]]
     expected = set(range(start_ms, end_ms, 60000))
     if set(by_ts) != expected:
-        raise DataError(f'missing {len(expected-set(by_ts))} or unexpected {len(set(by_ts)-expected)} 1m candles')
+        raise DataError(f'missing {len(expected - set(by_ts))} or unexpected {len(set(by_ts) - expected)} 1m candles')
     values = np.array([by_ts[t] for t in sorted(expected)], dtype=float)
     if not np.isfinite(values).all():
         raise DataError('nonfinite OHLCV')
@@ -83,10 +130,11 @@ def candles(symbol, start_ms, end_ms):
         raise DataError('zero daily volume')
     return values
 
+
 def profile(values):
-    """Uniformly distribute each minute's base volume across price rows (approximation)."""
-    hi = values[:, 1]; lo = values[:, 2]; close = values[:, 3]; vol = values[:, 4]
-    bottom = float(np.min(lo)); top = float(np.max(hi))
+    """Uniformly distribute each minute's base volume across intersected rows."""
+    hi, lo, close, vol = values[:, 1], values[:, 2], values[:, 3], values[:, 4]
+    bottom, top = float(np.min(lo)), float(np.max(hi))
     if top <= bottom:
         raise DataError('flat daily price range')
     edges = np.linspace(bottom, top, ROWS + 1)
@@ -106,20 +154,23 @@ def profile(values):
             histogram[j] += v * overlap / (high - low)
     poc = int(np.argmax(histogram))
     left = right = poc
-    total = float(histogram.sum()); accumulated = float(histogram[poc])
+    total = float(histogram.sum())
+    accumulated = float(histogram[poc])
     while accumulated < VALUE_AREA * total and (left > 0 or right < ROWS - 1):
         lower = histogram[left - 1] if left > 0 else -1
         upper = histogram[right + 1] if right < ROWS - 1 else -1
         if upper >= lower and right < ROWS - 1:
-            right += 1; accumulated += histogram[right]
+            right += 1
+            accumulated += histogram[right]
         else:
-            left -= 1; accumulated += histogram[left]
+            left -= 1
+            accumulated += histogram[left]
     return float(edges[left]), float(edges[right + 1]), float((edges[poc] + edges[poc + 1]) / 2)
+
 
 def analyze(symbol, start_ms, end_ms):
     values = candles(symbol, start_ms, end_ms)
     val, vah, poc = profile(values)
-    # The 23:59 UTC minute close is the final completed 15-minute candle close.
     close = float(values[-1, 3])
     direction = 'BUY' if close > vah else ('SELL' if close < val else None)
     if direction:
@@ -127,74 +178,64 @@ def analyze(symbol, start_ms, end_ms):
                 'vah': vah, 'val': val, 'poc': poc}
     return None
 
+
 def distance_percent(hit):
     boundary = hit['vah'] if hit['direction'] == 'BUY' else hit['val']
-    if boundary <= 0:
-        return float('inf')
-    return abs(hit['close'] - boundary) / boundary * 100
+    return abs(hit['close'] - boundary) / boundary * 100 if boundary > 0 else float('inf')
 
-def sort_signals(hits):
-    return sorted(hits, key=lambda h: (distance_percent(h), h['symbol']))
 
-def build_messages(hits, day, checked, total, errors):
-    """Pack whole signal lines into Telegram-safe messages (<= 3900 chars each)."""
-    heading = (f'Bitget FRVP {ROWS} rows / VA {VALUE_AREA:.0%} | {day} UTC\n'
-               f'Checked {checked}/{total} | Signals {len(hits)}\n'
-               'Sorted by distance to VAH/VAL\n'
-               'Approximation from 1-minute base volume')
-    lines = []
-    for rank, h in enumerate(hits, 1):
-        lines.append(f"#{rank} {h['direction']} {h['symbol']} | Abstand {distance_percent(h):.3f}% "
-                     f"| Close {h['close']:.9g} | VAH {h['vah']:.9g} | VAL {h['val']:.9g}")
-    if errors:
-        lines.append(f'WARNING: {len(errors)} symbols skipped (see GitHub logs)')
-    # Leave ample space for headers and part numbers, do not cut signal lines.
-    max_body = 3500
-    chunks = []
-    current = []
-    length = 0
-    for line in lines:
-        needed = len(line) + 1
-        if current and length + needed > max_body:
-            chunks.append(current)
-            current = []
-            length = 0
-        current.append(line)
-        length += needed
-    if current:
-        chunks.append(current)
-    count = len(chunks)
-    return [f'{heading}\nTeil {i}/{count}\n\n' + '\n'.join(chunk)
-            for i, chunk in enumerate(chunks, 1)]
-
-def send_telegram(message):
+def telegram_send(message):
     token = os.environ['TELEGRAM_BOT_TOKEN']
-    chat = os.environ['TELEGRAM_CHAT_ID']
+    chat_id = os.environ['TELEGRAM_CHAT_ID']
     url = f'https://api.telegram.org/bot{token}/sendMessage'
-    if len(message) > 4096:
-        raise DataError('Telegram message exceeds 4096 characters')
     for attempt in range(5):
         try:
-            r = requests.post(url, data={'chat_id': chat, 'text': message}, timeout=30)
-            if r.status_code == 429 or r.status_code >= 500:
-                retry_after = None
+            response = requests.post(url, data={'chat_id': chat_id, 'text': message}, timeout=30)
+            if response.status_code == 429:
+                retry_after = 3
                 try:
-                    retry_after = r.json().get('parameters', {}).get('retry_after')
-                except ValueError:
+                    retry_after = int(response.json().get('parameters', {}).get('retry_after', 3))
+                except (ValueError, TypeError):
                     pass
-                if attempt == 4:
-                    r.raise_for_status()
-                time.sleep(min(max(float(retry_after or 2 ** attempt), 1), 60))
+                time.sleep(min(max(retry_after, 1), 60))
                 continue
-            r.raise_for_status()
-            if not r.json().get('ok'):
+            response.raise_for_status()
+            if not response.json().get('ok'):
                 raise DataError('Telegram rejected message')
             return
         except (requests.RequestException, ValueError) as exc:
             if attempt == 4:
-                raise DataError(f'Telegram delivery failed: {exc}') from exc
+                raise DataError(f'Telegram send failed: {exc}') from exc
             time.sleep(min(2 ** attempt, 12))
-    raise DataError('Telegram delivery failed after retries')
+    raise DataError('Telegram send failed after retries')
+
+
+def send_telegram_parts(header, entries, footer=''):
+    # Build messages without cutting individual signal lines.
+    parts = []
+    current = []
+    size = 0
+    for entry in entries:
+        if current and size + len(entry) + 1 > TELEGRAM_MAX_CHARS - 350:
+            parts.append(current)
+            current = []
+            size = 0
+        current.append(entry)
+        size += len(entry) + 1
+    if current:
+        parts.append(current)
+    total = len(parts)
+    for index, lines in enumerate(parts, 1):
+        title = f'{header}\nTeil {index}/{total}\n\n'
+        message = title + '\n'.join(lines)
+        if index == total and footer:
+            message += '\n\n' + footer
+        if len(message) > 4096:
+            raise DataError('Telegram message unexpectedly exceeds 4096 characters')
+        telegram_send(message)
+        logging.info('Telegram part %d/%d sent (%d characters)', index, total, len(message))
+        time.sleep(0.5)
+
 
 def main():
     if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'):
@@ -209,10 +250,10 @@ def main():
         raise DataError('Day not fully closed yet')
     if (now - end).days > 25:
         raise DataError('1m history may be unavailable after 25 days')
-    start_ms = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-    names = symbols(); hits = []; errors = []
-    logging.info('Scanning %s symbols for %s UTC', len(names), day)
+    start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+    names = symbols()
+    hits, errors = [], []
+    logging.info('Scanning %d liquid crypto symbols for %s UTC', len(names), day)
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(analyze, name, start_ms, end_ms): name for name in names}
         for i, future in enumerate(as_completed(futures), 1):
@@ -224,24 +265,29 @@ def main():
             except Exception as exc:
                 errors.append((name, str(exc)))
                 logging.warning('%s skipped: %s', name, exc)
-            if i % 50 == 0:
+            if i % 25 == 0:
                 logging.info('%d/%d complete, %d hits, %d skipped', i, len(names), len(hits), len(errors))
-    hits = sort_signals(hits)
-    for rank, h in enumerate(hits, 1):
+    hits.sort(key=lambda h: (distance_percent(h), h['symbol']))
+    for rank, hit in enumerate(hits, 1):
         logging.info('#%d %s %s distance=%.4f%% close=%g VAH=%g VAL=%g POC=%g',
-                     rank, h['direction'], h['symbol'], distance_percent(h),
-                     h['close'], h['vah'], h['val'], h['poc'])
-    logging.info('Finished: %d scanned, %d hits, %d skipped', len(names), len(hits), len(errors))
-    if len(errors) > len(names) * 0.2:
-        raise DataError(f'Too many symbols skipped: {len(errors)}/{len(names)}; no Telegram alert sent')
+                     rank, hit['direction'], hit['symbol'], distance_percent(hit),
+                     hit['close'], hit['vah'], hit['val'], hit['poc'])
+    logging.info('Finished: %d selected, %d hits, %d skipped', len(names), len(hits), len(errors))
     if hits:
-        messages = build_messages(hits, day, len(names) - len(errors), len(names), errors)
-        logging.info('Sending %d Telegram messages for %d hits', len(messages), len(hits))
-        for i, message in enumerate(messages, 1):
-            send_telegram(message)
-            logging.info('Telegram part %d/%d delivered', i, len(messages))
-            if i < len(messages):
-                time.sleep(1.2)
+        header = (f'Bitget FRVP {ROWS} rows / VA {VALUE_AREA:.0%} | {day} UTC\n'
+                  f'Checked {len(names)-len(errors)}/{len(names)} | Signals {len(hits)}\n'
+                  f'Filter: >= {MIN_VOLUME_USDT/1_000_000:g}M USDT/24h, top {MAX_SYMBOLS}\n'
+                  'Sorted by distance to VAH/VAL; approximate 1m profile')
+        entries = [
+            f"#{rank} {hit['direction']} {hit['symbol']} | Abstand {distance_percent(hit):.3f}% "
+            f"| Close {hit['close']:.9g} | VAH {hit['vah']:.9g} | VAL {hit['val']:.9g}"
+            for rank, hit in enumerate(hits, 1)
+        ]
+        footer = f'WARNING: {len(errors)} symbols skipped (see GitHub logs)' if errors else ''
+        send_telegram_parts(header, entries, footer)
+    if len(errors) > len(names) * 0.2:
+        raise DataError(f'Too many symbols skipped: {len(errors)}/{len(names)}')
+
 
 if __name__ == '__main__':
     main()
