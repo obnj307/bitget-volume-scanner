@@ -1,4 +1,37 @@
 {
   "monitor_date_utc": "2026-11-13",
-  "sent": {}
+  "sent": {
+    "AVAXUSDT": {
+      "stages": {
+        "approach": {
+          "close": 8.266,
+          "m15_end_utc": "2026-11-13 07:00 UTC",
+          "poc": 8.318000000000001
+        }
+      }
+    },
+    "PEPEUSDT": {
+      "stages": {
+        "contact": {
+          "close": 4.5466e-06,
+          "m15_end_utc": "2026-11-13 07:00 UTC",
+          "poc": 4.5402499999999994e-06
+        },
+        "near": {
+          "close": 4.5466e-06,
+          "m15_end_utc": "2026-11-13 07:00 UTC",
+          "poc": 4.5402499999999994e-06
+        }
+      }
+    },
+    "WLDUSDT": {
+      "stages": {
+        "approach": {
+          "close": 0.2976,
+          "m15_end_utc": "2026-11-13 07:00 UTC",
+          "poc": 0.30025416666666666
+        }
+      }
+    }
+  }
 }
