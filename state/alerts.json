@@ -43,6 +43,15 @@
         }
       }
     },
+    "SUIUSDT": {
+      "stages": {
+        "contact": {
+          "close": 0.8027,
+          "m15_end_utc": "2026-11-13 10:45 UTC",
+          "poc": 0.8016308333333334
+        }
+      }
+    },
     "WLDUSDT": {
       "stages": {
         "approach": {
