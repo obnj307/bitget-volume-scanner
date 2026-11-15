@@ -1,4 +1,14 @@
 {
   "monitor_date_utc": "2026-11-15",
-  "sent": {}
+  "sent": {
+    "KAVAUSDT": {
+      "stages": {
+        "contact": {
+          "close": 0.02815,
+          "m15_end_utc": "2026-11-15 07:30 UTC",
+          "poc": 0.028311
+        }
+      }
+    }
+  }
 }
