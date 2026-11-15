@@ -1,6 +1,15 @@
 {
   "monitor_date_utc": "2026-11-15",
   "sent": {
+    "AVAXUSDT": {
+      "stages": {
+        "approach": {
+          "close": 7.144,
+          "m15_end_utc": "2026-11-15 14:45 UTC",
+          "poc": 7.0947499999999994
+        }
+      }
+    },
     "KAVAUSDT": {
       "stages": {
         "contact": {
