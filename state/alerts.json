@@ -1,32 +1,4 @@
 {
-  "monitor_date_utc": "2026-11-17",
-  "sent": {
-    "NEARUSDT": {
-      "stages": {
-        "contact": {
-          "close": 3.1755,
-          "m15_end_utc": "2026-11-17 17:15 UTC",
-          "poc": 3.1745333333333337
-        }
-      }
-    },
-    "SUIUSDT": {
-      "stages": {
-        "contact": {
-          "close": 0.7184,
-          "m15_end_utc": "2026-11-17 17:15 UTC",
-          "poc": 0.7202350000000001
-        }
-      }
-    },
-    "XRPUSDT": {
-      "stages": {
-        "contact": {
-          "close": 0.9587,
-          "m15_end_utc": "2026-11-17 17:15 UTC",
-          "poc": 0.9557916666666667
-        }
-      }
-    }
-  }
+  "monitor_date_utc": "2026-11-18",
+  "sent": {}
 }
