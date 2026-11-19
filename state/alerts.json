@@ -1,4 +1,23 @@
 {
   "monitor_date_utc": "2026-11-19",
-  "sent": {}
+  "sent": {
+    "ADAUSDT": {
+      "stages": {
+        "contact": {
+          "close": 0.154,
+          "m15_end_utc": "2026-11-19 12:00 UTC",
+          "poc": 0.15414416666666664
+        }
+      }
+    },
+    "ENAUSDT": {
+      "stages": {
+        "approach": {
+          "close": 0.11138,
+          "m15_end_utc": "2026-11-19 12:00 UTC",
+          "poc": 0.11104825
+        }
+      }
+    }
+  }
 }
