@@ -1,32 +1,4 @@
 {
-  "monitor_date_utc": "2026-11-19",
-  "sent": {
-    "ADAUSDT": {
-      "stages": {
-        "contact": {
-          "close": 0.154,
-          "m15_end_utc": "2026-11-19 12:00 UTC",
-          "poc": 0.15414416666666664
-        }
-      }
-    },
-    "ENAUSDT": {
-      "stages": {
-        "approach": {
-          "close": 0.11138,
-          "m15_end_utc": "2026-11-19 12:00 UTC",
-          "poc": 0.11104825
-        }
-      }
-    },
-    "PEPEUSDT": {
-      "stages": {
-        "contact": {
-          "close": 3.7235e-06,
-          "m15_end_utc": "2026-11-19 20:30 UTC",
-          "poc": 3.729419166666667e-06
-        }
-      }
-    }
-  }
+  "monitor_date_utc": "2026-11-20",
+  "sent": {}
 }
