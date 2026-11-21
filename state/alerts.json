@@ -1,4 +1,37 @@
 {
   "monitor_date_utc": "2026-11-21",
-  "sent": {}
+  "sent": {
+    "PEPEUSDT": {
+      "stages": {
+        "approach": {
+          "close": 3.4415e-06,
+          "m15_end_utc": "2026-11-21 14:45 UTC",
+          "poc": 3.418204166666667e-06
+        }
+      }
+    },
+    "SUIUSDT": {
+      "stages": {
+        "contact": {
+          "close": 0.6505,
+          "m15_end_utc": "2026-11-21 14:45 UTC",
+          "poc": 0.650225
+        }
+      }
+    },
+    "WLDUSDT": {
+      "stages": {
+        "contact": {
+          "close": 0.2313,
+          "m15_end_utc": "2026-11-21 14:45 UTC",
+          "poc": 0.2313325
+        },
+        "near": {
+          "close": 0.2313,
+          "m15_end_utc": "2026-11-21 14:45 UTC",
+          "poc": 0.2313325
+        }
+      }
+    }
+  }
 }
