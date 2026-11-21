@@ -1,6 +1,15 @@
 {
   "monitor_date_utc": "2026-11-21",
   "sent": {
+    "LTCUSDT": {
+      "stages": {
+        "contact": {
+          "close": 39.98,
+          "m15_end_utc": "2026-11-21 20:30 UTC",
+          "poc": 39.939
+        }
+      }
+    },
     "PEPEUSDT": {
       "stages": {
         "approach": {
@@ -21,6 +30,11 @@
     },
     "WLDUSDT": {
       "stages": {
+        "approach": {
+          "close": 0.2291,
+          "m15_end_utc": "2026-11-21 20:30 UTC",
+          "poc": 0.2313325
+        },
         "contact": {
           "close": 0.2313,
           "m15_end_utc": "2026-11-21 14:45 UTC",
