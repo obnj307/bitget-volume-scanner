@@ -1,4 +1,23 @@
 {
   "monitor_date_utc": "2026-11-22",
-  "sent": {}
+  "sent": {
+    "DOGEUSDT": {
+      "stages": {
+        "contact": {
+          "close": 0.05536,
+          "m15_end_utc": "2026-11-22 15:30 UTC",
+          "poc": 0.05513483333333333
+        }
+      }
+    },
+    "PEPEUSDT": {
+      "stages": {
+        "contact": {
+          "close": 3.3997e-06,
+          "m15_end_utc": "2026-11-22 15:30 UTC",
+          "poc": 3.402741666666667e-06
+        }
+      }
+    }
+  }
 }
