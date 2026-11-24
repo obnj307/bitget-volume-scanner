@@ -1,46 +1,4 @@
 {
-  "monitor_date_utc": "2026-11-23",
-  "sent": {
-    "DOGEUSDT": {
-      "stages": {
-        "approach": {
-          "close": 0.05545,
-          "m15_end_utc": "2026-11-23 09:45 UTC",
-          "poc": 0.05513
-        }
-      }
-    },
-    "ETHUSDT": {
-      "stages": {
-        "approach": {
-          "close": 1723.77,
-          "m15_end_utc": "2026-11-23 09:45 UTC",
-          "poc": 1710.3297499999999
-        }
-      }
-    },
-    "NEARUSDT": {
-      "stages": {
-        "contact": {
-          "close": 2.9854,
-          "m15_end_utc": "2026-11-23 09:45 UTC",
-          "poc": 2.9875975
-        }
-      }
-    },
-    "ZECUSDT": {
-      "stages": {
-        "approach": {
-          "close": 800.48,
-          "m15_end_utc": "2026-11-23 09:45 UTC",
-          "poc": 794.79475
-        },
-        "contact": {
-          "close": 787.19,
-          "m15_end_utc": "2026-11-23 21:45 UTC",
-          "poc": 794.79475
-        }
-      }
-    }
-  }
+  "monitor_date_utc": "2026-11-24",
+  "sent": {}
 }
