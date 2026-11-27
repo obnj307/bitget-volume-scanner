@@ -1,4 +1,14 @@
 {
   "monitor_date_utc": "2026-11-27",
-  "sent": {}
+  "sent": {
+    "XMRUSDT": {
+      "stages": {
+        "contact": {
+          "close": 444.75,
+          "m15_end_utc": "2026-11-27 11:45 UTC",
+          "poc": 444.6346666666667
+        }
+      }
+    }
+  }
 }
