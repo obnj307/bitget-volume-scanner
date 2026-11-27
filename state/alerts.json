@@ -1,19 +1,4 @@
 {
-  "monitor_date_utc": "2026-11-26",
-  "sent": {
-    "ZECUSDT": {
-      "stages": {
-        "contact": {
-          "close": 729.09,
-          "m15_end_utc": "2026-11-26 11:15 UTC",
-          "poc": 728.7566666666667
-        },
-        "near": {
-          "close": 729.09,
-          "m15_end_utc": "2026-11-26 11:15 UTC",
-          "poc": 728.7566666666667
-        }
-      }
-    }
-  }
+  "monitor_date_utc": "2026-11-27",
+  "sent": {}
 }
