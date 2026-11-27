@@ -1,6 +1,15 @@
 {
   "monitor_date_utc": "2026-11-27",
   "sent": {
+    "NEARUSDT": {
+      "stages": {
+        "contact": {
+          "close": 3.0502,
+          "m15_end_utc": "2026-11-27 21:00 UTC",
+          "poc": 3.0574458333333334
+        }
+      }
+    },
     "XMRUSDT": {
       "stages": {
         "contact": {
